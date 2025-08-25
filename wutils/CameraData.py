@@ -1,4 +1,6 @@
+from ast import Tuple
 from dataclasses import dataclass
+from socket import if_indextoname
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation, FFMpegWriter
@@ -52,12 +54,15 @@ class CameraData:
         self.ndepth = self.ImageInfo()
         if self.depth.data is not None:
             self.ndepth.data = self.normalize_depth(method='global')
+
+        # Cache number of frames
+        if color_images is not None:
+            self.num_frames = len(self.color.data)
+        elif depth_images is not None:
+            self.num_frames = len(self.depth.data)
                 
         # Validate data consistency
         self._validate_data()
-
-        # Initialize MultiPlotter
-        self.multiplotter = None
     
     @property
     def elapsed_times(self):
@@ -208,7 +213,7 @@ class CameraData:
             self.ndepth.plotter.colormap = colormap
 
         return self.ndepth.plotter
-    
+
     def create_video(self, plotter, savefile: str, method = 'anim', 
                      colormap = None, **kwargs):
         """
@@ -221,12 +226,28 @@ class CameraData:
         plt.ioff()  # turn off interactive mode
 
         # Check input type
-        if not isinstance(plotter, ImagePlotter):
-            raise TypeError(f'Bad input type for video: {type(plotter)}')
+        if isinstance(plotter, Union[Tuple, tuple, List]):
+            if not all([isinstance(x, ImagePlotter) for x in plotter]):
+                raise TypeError('Not all elements are ImagePlotter')
+
+            plotter = MultiPlotter(plotter)
+
+        elif not isinstance(plotter, Union[ImagePlotter, MultiPlotter]):
+            raise TypeError(f'Unknown input of type {type(plotter)}')
+        
+        multiple = not isinstance(plotter, ImagePlotter)
+        
+        # Check number of frames
+        if multiple:
+            for _, subplot in enumerate(plotter.plotters):
+                if subplot._num_frame!= plotter.plotters[0]._num_frame:
+                    raise ValueError('Mismatch in number of frames')
         
         # Set colormap
-        if colormap is not None:
+        if not multiple and colormap is not None:
             plotter.colormap = colormap
+        elif colormap is not None:
+            raise ValueError('Ambiguous colormap input for multiple plots')
         
         # Generate video according to method
         match method.lower():
@@ -244,7 +265,7 @@ class CameraData:
 
         # Do real-time by adjusting number of times to write each frame
         if realtime:
-            dt       = np.diff(plotter.elapsed_times)
+            dt       = np.diff(self.elapsed_times)
             avg_dt   = np.mean(dt)
             avg_fps  = 1/avg_dt
             duration = np.hstack([dt, avg_dt])  # last frame uses avg_dt
@@ -258,7 +279,7 @@ class CameraData:
             fps = avg_fps
             num_write = np.ones(np.size(duration), dtype=int)
         else:  # not realtime
-            num_write = np.ones(plotter.__len__(), dtype=int)
+            num_write = np.ones(self.num_frames, dtype=int)
 
         # Calculate video dimensions
         figsize = plotter.fig.get_size_inches()
@@ -276,19 +297,35 @@ class CameraData:
                              )
         
         # Generate video
-        num_frames = plotter.__len__()
         try:
-            for ii in tqdm(range(num_frames), desc='Writing video frames'):
+            desc = 'Writing video frames'
 
-                # Update plot
-                plotter.index = ii
+            if isinstance(plotter, MultiPlotter):  # multi
+                for ii in tqdm(range(self.num_frames), desc=desc):
 
-                # Get frame data from buffer
-                frame = plotter.get_frame()
-                
-                # Write frame to video
-                for _ in range(num_write[ii]):
-                    out.write(frame)
+                    # Update plot
+                    for subplot in plotter.plotters:
+                        subplot.index = if_indextoname
+
+                    # Get frame data from buffer
+                    frame = plotter.get_frame()
+
+                    # Write frame to video
+                    for _ in range(num_write[ii]):
+                        out.write(frame)
+
+            else:
+                for ii in tqdm(range(self.num_frames), desc=desc):
+
+                    # Update plot
+                    plotter.index = ii
+
+                    # Get frame data from buffer
+                    frame = plotter.get_frame()
+                    
+                    # Write frame to video
+                    for _ in range(num_write[ii]):
+                        out.write(frame)
                 
         finally:
             out.release()
@@ -300,7 +337,7 @@ class CameraData:
 
         # Do real-time by using average time step, assumed near constant
         if realtime:
-            dt     = np.diff(plotter.elapsed_times)
+            dt     = np.diff(plotter.plotters[0].elapsed_times)
             avg_dt = np.mean(dt)
             std_dt = np.std(dt)
             coef   = std_dt / avg_dt
@@ -318,41 +355,71 @@ class CameraData:
             print(f'Using real-time FPS: {fps}')
 
         # Set up progress bar
-        progress_bar = tqdm(total=plotter.__len__(), desc='Rendering video')
+        progress_bar = tqdm(total=self.num_frames, desc='Rendering video')
                             
         # Define helper animate function
         plotter.show()  # need to assure ax.images[0] is available
         plotter.autoupdate = False  # draw with __animate() instead
-        def _animate(idx):
-            plotter.index = idx
 
-            plotter.ax.images[0].set_array(plotter.data[idx])  # image
+        if isinstance(plotter, MultiPlotter):
+            def _animate(idx):  # animate multiple
+                artists = []
+                
+                plotter._index = idx
+
+                for _, subplot in enumerate(plotter.plotters):
+                    subplot._index = idx
+                    subplot.ax.images[0].set_array(subplot.data[idx])
+                    artists.append(subplot.ax.images[0])
+                
+                if plotter.text is None and plotter._textbox is not None:
+                    frame_num = plotter._index + 1
+                    text = f'Frame {frame_num}/{self.num_frames}'
+
+                    t_avail = plotter.timestamps
+                    if t_avail is not None and (len(t_avail) != 0):
+                        dt = plotter.elapsed_times[plotter._index]
+                        text += f' | Elapsed: {dt:.2f} s'
+
+                    plotter._textbox.set_text(text)
+                    artists.append(plotter._textbox)
+                else:
+                    raise ValueError
+
+                progress_bar.update()
             
-            if plotter.title is None:
-                frame_num = plotter.index + 1
-                num_frame = plotter.__len__()
-                text = f'Frame {frame_num}/{num_frame}'
-
-                t_avail = plotter.timestamps
-                if t_avail is not None and (len(t_avail) != 0):
-                    dt = plotter.elapsed_times[plotter.index]
-                    text += f' | Elapsed: {dt:.2f} s'
-
-                plotter.ax.set_title(text, animated=True)
+                return artists
             
-            progress_bar.update()
-        
-            return [plotter.ax.images[0], plotter.ax.title]
-        
-        # Ensure animation is updated with current colormap
-        if plotter.colormap is not None:
-            plotter.ax.images[0].set_cmap(plotter.colormap)
-        
+            for _, subplot in enumerate(plotter.plotters):  # colormap
+                if subplot.colormap is not None:
+                    subplot.ax.images[0].set_cmap(subplot.colormap)
+            
+        else:
+            def _animate(idx):  # animate single
+                plotter._index = idx
+
+                plotter.ax.images[0].set_array(plotter.data[idx]) 
+                
+                if plotter.title is None:
+                    frame_num = plotter._index + 1
+                    text = f'Frame {frame_num}/{self.num_frames}'
+
+                    t_avail = plotter.timestamps
+                    if t_avail is not None and (len(t_avail) != 0):
+                        dt = plotter.elapsed_times[plotter._index]
+                        text += f' | Elapsed: {dt:.2f} s'
+
+                    plotter.ax.set_title(text, animated=True)
+                
+                progress_bar.update()
+            
+                return [plotter.ax.images[0], plotter.ax.title]
+            
         # Create animation with blitting for performance
         anim = FuncAnimation(
             plotter.fig,
             _animate,
-            frames=plotter.__len__(),
+            frames=self.num_frames,
             interval=1000/fps,  # milliseconds btwn frames
             blit=True,
             repeat=False
@@ -376,9 +443,6 @@ class CameraData:
         finally:
             progress_bar.close()
             print(f'Video saved to: {savefile}')
-
-    def __len__(self):
-        return len(self.timestamps)
     
 class ImagePlotter:
     def __init__(self, data, timestamps = None, title = None, colormap = None):
@@ -389,6 +453,7 @@ class ImagePlotter:
         self.title = title
         self.colormap = colormap
         self.autoupdate = True
+        self._num_frame = len(data)
         self._index = 0
 
     @property
@@ -418,6 +483,7 @@ class ImagePlotter:
             self.ax.axis('off')
         
         self.fig.show()
+        plt.tight_layout()
         self.update_plot()
         return self
     
@@ -429,8 +495,7 @@ class ImagePlotter:
 
         if self.title is None:
             frame_num = self.index + 1
-            num_frame = self.__len__()
-            text = f'Frame {frame_num}/{num_frame}'
+            text = f'Frame {frame_num}/{self._num_frame}'
 
             if self.timestamps is not None and (len(self.timestamps) != 0):
                 dt = self.elapsed_times[self._index]
@@ -498,10 +563,154 @@ class ImagePlotter:
         frame = cv2.cvtColor(rgb_buffer, cv2.COLOR_RGB2BGR)
 
         return frame
-
-    def __len__(self):
-        return len(self.data)
     
+class MultiPlotter:
+    """Class for multiple ImagePlotters as subplots"""
+
+    def __init__(self, plotters: Union[List[ImagePlotter], ImagePlotter]):
+        if isinstance(plotters, ImagePlotter):
+            self.plotters = [plotters]
+        else:
+            self.plotters = plotters
+        self.fig = None
+        self.axes = None
+        self.text = None
+        self.autoupdate = True
+        self._index = 0
+        self._textbox = None
+        self._num_frame = self.plotters[0]._num_frame
+
+    @property
+    def ax(self):
+        return self.axes
+
+    @property
+    def timestamps(self):
+        for _, plotter in enumerate(self.plotters):
+            difft = np.abs(plotter.timestamps - self.plotters[0].timestamps)
+            if np.sum(difft) > 10**-6:
+                raise ValueError('Discrepancy in timestamps of subplots')
+            
+        return self.plotters[0].timestamps
+
+    @property
+    def elapsed_times(self):
+        return self.timestamps - self.timestamps[0]
+        
+    @property
+    def index(self):
+        if self._index < 0:
+            return len(self.data) + self._index
+        else:
+            return self._index
+    
+    @index.setter
+    def index(self, idx):
+        if -len(self.data) <= idx < len(self.data):
+            self._index = idx
+        else:
+            raise IndexError(f'index out of range {len(self.images)} images')
+        if self.autoupdate:
+            for _, plotter in enumerate(self.plotters):
+                plotter.index = idx
+            self.update_plot()
+        
+    def show(self):
+        """Generates subplots and shows figure"""
+        nplots = len(self.plotters)
+
+        if (nplots > 3):
+            raise ValueError(f'No more than 3 plots supported (found {nplots})')
+
+        if self.fig is None:
+            nrows, ncols = 1, nplots
+
+            match ncols:
+                case 1:
+                    figsize = (8, 5)
+                case 2:
+                    figsize = (12, 4)
+                case 3:
+                    figsize = (14, 4)
+
+            self.fig, self.axes = plt.subplots(nrows, ncols, figsize=figsize)
+
+            if nplots == 1:
+                self.axes = [self.axes]
+
+            for ii, subplot in enumerate(self.plotters):
+                self.axes[ii].axis('off')
+                subplot.ax = self.axes[ii]
+
+            # Place textbox in a subplot
+            subplot = self.plotters[0]
+            self._textbox = subplot.ax.text(
+                0.012, 0.92,  # x=center, y=slightly below axes
+                f'Frame {self._index}/{self._num_frame}',
+                transform=subplot.ax.transAxes,
+                ha='left', va='bottom',
+                fontsize=10, fontweight='bold',
+                bbox=dict(boxstyle='round,pad=0.3',
+                          facecolor='white',
+                          alpha=0.8)
+            )
+        
+        self.fig.show()
+        plt.tight_layout()
+        self.update_plot()
+        return self
+    
+    def update_plot(self):
+
+        # Update individual subplots
+        for _, plotter in enumerate(self.plotters):
+            if plotter.colormap:
+                plotter.ax.imshow(plotter.data[self._index],
+                                     cmap=plotter.colormap)
+            else:
+                plotter.ax.imshow(plotter.data[self._index])
+            
+            if plotter.title is not None:
+                plotter.ax.set_title(plotter.title,
+                                    fontsize=14, fontweight='bold')
+
+        # Update global info
+        if self.text is None:
+            frame_num = self.index + 1
+            text = f'Frame {frame_num}/{self._num_frame}'
+            if self.timestamps is not None and (len(self.timestamps) != 0):
+                dt = self.elapsed_times[self._index]
+                text += f' | Elapsed: {dt:.2f} s'
+            
+            self._textbox.set_text(text)
+
+        self.fig.canvas.draw()
+
+    def get_frame(self):
+        """Same as ImagePlotter.get_frame()"""
+
+        if self.fig is None:
+            raise ValueError('No figure from which to fetch frame data')
+                
+        # Get buffer and dimensions
+        (buffer, image_shape) = self.fig.canvas.print_to_buffer()
+        buffer = np.frombuffer(  # from byte-like object to array
+            buffer,
+            dtype=np.uint8  # 8-bit rgb
+        )
+        image_shape = image_shape[::-1] + (3,)  # (w, h) -> (h, w, C)
+
+        # Reform original image effect in format (H, W, C)
+        r = buffer[0::4]  # red
+        g = buffer[1::4]  # green
+        b = buffer[2::4]  # blue
+        rgb_buffer = np.stack([r, g, b], axis=-1).reshape(image_shape)
+                
+        # Convert RGB to BGR for OpenCV
+        frame = cv2.cvtColor(rgb_buffer, cv2.COLOR_RGB2BGR)
+
+        return frame
+
 if __name__ == '__main__':
     # --- CONFIG ---
     LOAD_CSV = True
@@ -509,7 +718,7 @@ if __name__ == '__main__':
                             'realsense/data_valid/',
                             'ts_merged_2021_11_09_16h15m31s/')
     SAVE_PIC = False
-    SAVE_VID = False
+    SAVE_VID = True
 
     # --- PRE-PROCESSING ---
     if LOAD_CSV:
@@ -542,8 +751,14 @@ if __name__ == '__main__':
     
     if SAVE_VID:
         color = camera.plot_color()
-        camera.create_video(color, 'sample_1.mp4')
+        color.title = 'RGB'
 
-        depth = camera.plot_depth()
+        depth = camera.plot_depth(method='global')
+        depth.title = 'Depth (normalized globally)'
         depth.colormap = 'gray'
-        camera.create_video(depth, 'sample_2.mp4')
+
+        ndepth = camera.plot_ndepth(method='image')
+        ndepth.title = '(normalized by image)'
+        ndepth.colormap = 'gray'
+
+        camera.create_video((color, depth, ndepth), 'sample.mp4')
